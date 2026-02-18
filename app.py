@@ -7,163 +7,136 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Config from environment variables ---
-TV_USERNAME     = os.environ.get('TV_USERNAME', 'APEX_493686')
-TV_PASSWORD     = os.environ.get('TV_PASSWORD', '')
-TV_ACCOUNT_SPEC = os.environ.get('TV_ACCOUNT_SPEC', 'APEX4936860000001')
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'UTBot2026')
-BASE_URL        = os.environ.get('TV_BASE_URL', 'https://demo.tradovateapi.com/v1')
+# Config from environment variables
+TRADOVATE_USERNAME = os.environ.get('TRADOVATE_USERNAME')
+TRADOVATE_PASSWORD = os.environ.get('TRADOVATE_PASSWORD')
+TRADOVATE_DEVICE_ID = os.environ.get('TRADOVATE_DEVICE_ID', 'utbot-device-001')
+TRADOVATE_APP_ID    = os.environ.get('TRADOVATE_APP_ID', 'tradovate')
+TRADOVATE_APP_VERSION = os.environ.get('TRADOVATE_APP_VERSION', '1.0')
+WEBHOOK_SECRET      = os.environ.get('WEBHOOK_SECRET', 'utbot_tradovate_secret_2026')
+SYMBOL              = os.environ.get('SYMBOL', 'MNQH5')
+CONTRACT_SIZE       = int(os.environ.get('CONTRACT_SIZE', 1))
 
-_access_token = None
+BASE_URL = "https://demo.tradovateapi.com/v1"
 
-def get_access_token():
-    global _access_token
+def get_token():
+    logger.info("Requesting access token...")
+    url = f"{BASE_URL}/auth/accesstokenrequest"
+    payload = {
+        "name": TRADOVATE_USERNAME,
+        "password": TRADOVATE_PASSWORD,
+        "appId": TRADOVATE_APP_ID,
+        "appVersion": TRADOVATE_APP_VERSION,
+        "deviceId": TRADOVATE_DEVICE_ID,
+        "cid": 0,
+        "sec": ""
+    }
     try:
-        resp = requests.post(
-            f'{BASE_URL}/auth/accesstokenrequest',
-            json={
-                'name': TV_USERNAME,
-                'password': TV_PASSWORD,
-                'appId': 'Sample App',
-                'appVersion': '1.0',
-                'cid': 0,
-                'sec': ''
-            },
-            timeout=10
-        )
-        data = resp.json()
-        logger.info(f'Auth response: {data}')
-        token = data.get('accessToken')
-        if token:
-            _access_token = token
-            return token
-        logger.error(f'Auth failed: {data}')
-        return None
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        logger.info("Successfully obtained token.")
+        return data.get('accessToken')
     except Exception as e:
-        logger.error(f'Auth exception: {e}')
+        logger.error(f"Failed to get token: {e}")
         return None
 
-def get_account_id():
-    token = get_access_token()
-    if not token:
-        return None, None
+def get_account_id(token):
+    url = f"{BASE_URL}/account/list"
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        resp = requests.get(
-            f'{BASE_URL}/account/list',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=10
-        )
-        accounts = resp.json()
-        logger.info(f'Accounts: {accounts}')
-        for acct in accounts:
-            if acct.get('name') == TV_ACCOUNT_SPEC:
-                return token, acct.get('id')
-        # fallback: return first account
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        accounts = r.json()
+        # Usually first account in list for Apex/Tradovate
         if accounts:
-            return token, accounts[0].get('id')
-        return token, None
+            return accounts[0].get('id')
     except Exception as e:
-        logger.error(f'Account lookup exception: {e}')
-        return token, None
+        logger.error(f"Failed to get account ID: {e}")
+    return None
 
-def place_order(action, symbol, qty=1):
-    token, account_id = get_account_id()
-    if not token or not account_id:
-        return {'error': 'Auth or account lookup failed'}
-    tv_action = 'Buy' if action.lower() in ['buy', 'long'] else 'Sell'
+def place_order(token, account_id, action):
+    url = f"{BASE_URL}/order/placeorder"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # Map TradingView actions to Tradovate actions
+    # strategy.order.action is usually 'buy' or 'sell'
+    tv_action = action.lower()
+    tradovate_action = "Buy" if "buy" in tv_action else "Sell"
+    
     payload = {
-        'accountSpec': TV_ACCOUNT_SPEC,
-        'accountId': account_id,
-        'action': tv_action,
-        'symbol': symbol,
-        'orderQty': qty,
-        'orderType': 'Market',
-        'isAutomated': True
+        "account": account_id,
+        "symbol": SYMBOL,
+        "action": tradovate_action,
+        "orderStrategyTypeId": 0,
+        "orderQty": CONTRACT_SIZE,
+        "orderType": "Market",
+        "isCheckOnly": False
     }
-    logger.info(f'Placing order: {payload}')
+    
+    logger.info(f"Placing {tradovate_action} order for {SYMBOL}...")
     try:
-        resp = requests.post(
-            f'{BASE_URL}/order/placeorder',
-            headers={
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json'
-            },
-            json=payload,
-            timeout=10
-        )
-        result = resp.json()
-        logger.info(f'Order result: {result}')
-        return result
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        logger.info(f"Order successful: {r.json()}")
+        return True
     except Exception as e:
-        logger.error(f'Order exception: {e}')
-        return {'error': str(e)}
+        logger.error(f"Order failed: {e}")
+        return False
 
-def close_position(symbol):
-    token, account_id = get_account_id()
-    if not token or not account_id:
-        return {'error': 'Auth or account lookup failed'}
-    payload = {
-        'accountId': account_id,
-        'symbol': symbol,
-        'isAutomated': True
-    }
-    logger.info(f'Closing position: {payload}')
+def liquidate_all(token, account_id):
+    url = f"{BASE_URL}/order/liquidate"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"accountId": account_id, "symbol": SYMBOL}
+    logger.info(f"Liquidating position for {SYMBOL}...")
     try:
-        resp = requests.post(
-            f'{BASE_URL}/order/liquidateposition',
-            headers={
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json'
-            },
-            json=payload,
-            timeout=10
-        )
-        result = resp.json()
-        logger.info(f'Close result: {result}')
-        return result
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        logger.info("Liquidate successful.")
+        return True
     except Exception as e:
-        logger.error(f'Close exception: {e}')
-        return {'error': str(e)}
+        logger.error(f"Liquidate failed: {e}")
+        return False
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({'error': 'Invalid JSON'}), 400
-
-    # Security check
+    data = request.json
+    logger.info(f"Received webhook: {data}")
+    
+    # 1. Secret check
     if data.get('secret') != WEBHOOK_SECRET:
-        logger.warning(f'Unauthorized webhook attempt')
-        return jsonify({'error': 'Unauthorized'}), 401
-
+        logger.warning("Invalid secret received.")
+        return jsonify({"status": "error", "message": "unauthorized"}), 401
+    
+    # 2. Authenticate
+    token = get_token()
+    if not token:
+        return jsonify({"status": "error", "message": "auth_failed"}), 500
+    
+    # 3. Get Account
+    account_id = get_account_id(token)
+    if not account_id:
+        return jsonify({"status": "error", "message": "account_not_found"}), 500
+    
+    # 4. Handle Action
     action = data.get('action', '').lower()
-    symbol = data.get('symbol', '').upper()
-    qty    = int(data.get('qty', 1))
-
-    logger.info(f'Webhook: action={action} symbol={symbol} qty={qty}')
-
-    if not symbol:
-        return jsonify({'error': 'symbol required'}), 400
-
-    if action in ['buy', 'long', 'sell', 'short']:
-        result = place_order(action, symbol, qty)
-    elif action in ['exit', 'exitlong', 'exitshort', 'close', 'flat']:
-        result = close_position(symbol)
+    
+    if action in ['buy', 'sell']:
+        success = place_order(token, account_id, action)
+    elif action == 'exit':
+        success = liquidate_all(token, account_id)
     else:
-        return jsonify({'error': f'Unknown action: {action}'}), 400
+        logger.warning(f"Unknown action: {action}")
+        return jsonify({"status": "error", "message": "unknown_action"}), 400
+        
+    if success:
+        return jsonify({"status": "success"}), 200
+    else:
+        return jsonify({"status": "error", "message": "execution_failed"}), 500
 
-    return jsonify(result), 200
-
-@app.route('/', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health():
-    return 'UTBot Tradovate Webhook Server - Running', 200
-
-@app.route('/test-auth', methods=['GET'])
-def test_auth():
-    token = get_access_token()
-    if token:
-        return jsonify({'status': 'ok', 'token_preview': token[:20] + '...'}), 200
-    return jsonify({'status': 'failed', 'error': 'Could not authenticate'}), 500
+    return "OK", 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
