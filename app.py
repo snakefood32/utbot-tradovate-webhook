@@ -31,7 +31,8 @@ def get_token():
     now = time.time()
     if _token and now - _token_ts < TOKEN_TTL:
         return _token
-    logger.info('Authenticating with Tradovate...')
+    
+    logger.info(f'Authenticating with Tradovate (User: {USERNAME[:4]}...)')
     payload = {
         'name': USERNAME,
         'password': PASSWORD,
@@ -41,25 +42,46 @@ def get_token():
         'cid': 0,
         'sec': ''
     }
-    r = requests.post(f'{BASE}/auth/accesstokenrequest', json=payload, timeout=15)
-    logger.info(f'Auth response [{r.status_code}]: {r.text[:300]}')
-    if r.status_code != 200:
-        raise RuntimeError(f'Auth failed: {r.status_code} {r.text}')
-    data = r.json()
-    if 'p-ticket' in data:
-        _p_ticket = data['p-ticket']
-        logger.info(f'Device verification required. p-ticket={_p_ticket}')
-        raise RuntimeError('Device verification required. Visit /verify/CODE with code from email.')
-    _p_ticket = None
-    _token = data.get('accessToken') or data.get('token')
-    _token_ts = now
-    logger.info('Authentication successful.')
-    return _token
+    
+    try:
+        r = requests.post(f'{BASE}/auth/accesstokenrequest', json=payload, timeout=15)
+        logger.info(f'Auth response [{r.status_code}]: {r.text[:300]}')
+        
+        if r.status_code != 200:
+            raise RuntimeError(f'Auth failed HTTP {r.status_code}: {r.text}')
+            
+        data = r.json()
+        
+        # Check for error in JSON even if HTTP 200
+        if 'errorText' in data:
+            err = data['errorText']
+            logger.error(f'Tradovate Error: {err}')
+            raise RuntimeError(f'Tradovate Auth Error: {err}')
+            
+        if 'p-ticket' in data:
+            _p_ticket = data['p-ticket']
+            logger.info(f'Device verification required. p-ticket={_p_ticket}')
+            raise RuntimeError('Device verification required. Check email for code.')
+            
+        _p_ticket = None
+        _token = data.get('accessToken') or data.get('token')
+        
+        if not _token:
+            raise RuntimeError(f'No token in response: {data}')
+            
+        _token_ts = now
+        logger.info('Authentication successful.')
+        return _token
+        
+    except Exception as e:
+        logger.error(f'get_token error: {e}')
+        raise
 
 def verify_device(code):
     global _token, _token_ts, _p_ticket
     if not _p_ticket:
         return False, 'No pending verification'
+    
     payload = {
         'name': USERNAME,
         'password': PASSWORD,
@@ -72,14 +94,21 @@ def verify_device(code):
         'p-code': code,
         'p-captcha': True
     }
+    
     r = requests.post(f'{BASE}/auth/accesstokenrequest', json=payload, timeout=15)
     logger.info(f'Verify response [{r.status_code}]: {r.text[:300]}')
+    
     if r.status_code != 200:
         return False, f'Verify failed: {r.text}'
+        
     data = r.json()
+    if 'errorText' in data:
+        return False, data['errorText']
+        
     tok = data.get('accessToken') or data.get('token')
     if not tok:
         return False, f'No token in response: {data}'
+        
     _p_ticket = None
     _token = tok
     _token_ts = time.time()
@@ -104,42 +133,48 @@ def get_account():
     return _acct_id
 
 def place_order(side):
-    acct = get_account()
-    action = 'Buy' if side == 'buy' else 'Sell'
-    r = requests.post(
-        f'{BASE}/order/placeorder',
-        headers=hdrs(),
-        json={
-            'accountId': acct,
-            'action': action,
-            'symbol': SYMBOL,
-            'orderQty': QTY,
-            'orderType': 'Market',
-            'isAutomated': True,
-        },
-        timeout=15
-    )
-    logger.info(f'Order [{r.status_code}]: {r.text}')
-    return r.status_code == 200
+    try:
+        acct = get_account()
+        action = 'Buy' if side == 'buy' else 'Sell'
+        r = requests.post(
+            f'{BASE}/order/placeorder',
+            headers=hdrs(),
+            json={
+                'accountId': acct,
+                'action': action,
+                'symbol': SYMBOL,
+                'orderQty': QTY,
+                'orderType': 'Market',
+                'isAutomated': True,
+            },
+            timeout=15
+        )
+        logger.info(f'Order [{r.status_code}]: {r.text}')
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f'Order placement failed: {e}')
+        return False
 
 def liquidate():
-    acct = get_account()
-    r = requests.post(
-        f'{BASE}/order/liquidateposition',
-        headers=hdrs(),
-        json={
-            'accountId': acct,
-            'symbol': SYMBOL,
-            'isAutomated': True
-        },
-        timeout=15
-    )
-    logger.info(f'Liquidate [{r.status_code}]: {r.text}')
+    try:
+        acct = get_account()
+        r = requests.post(
+            f'{BASE}/order/liquidateposition',
+            headers=hdrs(),
+            json={
+                'accountId': acct,
+                'symbol': SYMBOL,
+                'isAutomated': True
+            },
+            timeout=15
+        )
+        logger.info(f'Liquidate [{r.status_code}]: {r.text}')
+    except Exception as e:
+        logger.error(f'Liquidation failed: {e}')
 
 # State tracker
 last_signal = None
 
-# Flask routes
 @app.route('/')
 def index():
     needs_verify = _p_ticket is not None
@@ -158,7 +193,6 @@ def webhook():
     data = request.get_json(force=True, silent=True) or {}
     logger.info(f'Webhook received: {data}')
 
-    # Secret validation
     secret = data.get('secret', '')
     if secret != WEBHOOK_SECRET:
         logger.warning('Webhook secret mismatch')
@@ -178,20 +212,24 @@ def webhook():
             if last_signal == 'sell':
                 liquidate()
                 time.sleep(1)
-            place_order('buy')
-            last_signal = 'buy'
-            return jsonify({'status': 'buy order placed'}), 200
+            if place_order('buy'):
+                last_signal = 'buy'
+                return jsonify({'status': 'buy order placed'}), 200
+            else:
+                return jsonify({'error': 'Order placement failed'}), 500
 
         if action == 'sell':
             if last_signal == 'buy':
                 liquidate()
                 time.sleep(1)
-            place_order('sell')
-            last_signal = 'sell'
-            return jsonify({'status': 'sell order placed'}), 200
+            if place_order('sell'):
+                last_signal = 'sell'
+                return jsonify({'status': 'sell order placed'}), 200
+            else:
+                return jsonify({'error': 'Order placement failed'}), 500
 
     except Exception as e:
-        logger.error(f'Webhook error: {e}')
+        logger.error(f'Webhook processing error: {e}')
         return jsonify({'error': str(e)}), 500
 
 @app.route('/verify/<code>')
@@ -213,17 +251,17 @@ def status():
         'symbol': SYMBOL,
         'qty': QTY,
         'base_url': BASE,
+        'username_prefix': USERNAME[:4] if USERNAME else 'N/A'
     }), 200
 
 def init_auth():
-    """Try to authenticate on startup in background."""
-    time.sleep(3)
+    time.sleep(5)
     try:
         get_token()
         get_account()
         logger.info('Startup auth complete.')
     except Exception as e:
-        logger.warning(f'Startup auth: {e}')
+        logger.warning(f'Startup auth background task: {e}')
 
 _auth_thread = Thread(target=init_auth, daemon=True, name='init_auth')
 _auth_thread.start()
