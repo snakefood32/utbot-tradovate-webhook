@@ -17,7 +17,7 @@ APP_ID     = os.environ.get('TRADOVATE_APP_ID', 'tradovate')
 APP_VER    = os.environ.get('TRADOVATE_APP_VERSION', '1.0')
 SYMBOL     = os.environ.get('SYMBOL', 'MNQH5')
 QTY        = int(os.environ.get('CONTRACT_SIZE', '1'))
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'utbot_tradovate_secret_2026')
 BASE       = 'https://demo.tradovateapi.com/v1'
 
 _token     = None
@@ -158,12 +158,11 @@ def webhook():
     data = request.get_json(force=True, silent=True) or {}
     logger.info(f'Webhook received: {data}')
 
-    # Optional secret validation
-    if WEBHOOK_SECRET:
-        secret = data.get('secret', '')
-        if secret != WEBHOOK_SECRET:
-            logger.warning('Webhook secret mismatch')
-            return jsonify({'error': 'Unauthorized'}), 401
+    # Secret validation
+    secret = data.get('secret', '')
+    if secret != WEBHOOK_SECRET:
+        logger.warning('Webhook secret mismatch')
+        return jsonify({'error': 'Unauthorized'}), 401
 
     action = str(data.get('action', '')).lower().strip()
     if action not in ('buy', 'sell', 'close', 'liquidate'):
